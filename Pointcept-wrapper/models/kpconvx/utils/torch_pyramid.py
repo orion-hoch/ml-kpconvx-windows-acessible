@@ -18,7 +18,7 @@ from easydict import EasyDict
 
 
 from pointcept.models.kpconvx.utils.gpu_subsampling import subsample_pack_batch
-from pointcept.models.kpconvx.utils.gpu_neigbors import radius_search_pack_mode, keops_radius_count
+from pointcept.models.kpconvx.utils.gpu_neigbors import radius_search_pack_mode, tc_radius_count
 
 from pointcept.models.kpconvx.utils.cpp_funcs import batch_grid_partition
 
@@ -274,7 +274,7 @@ def pyramid_neighbor_stats(points: Tensor,
     for i in range(num_layers):
         if i > 0:
             points, lengths = subsample_pack_batch(points, lengths, sub_size, method=sub_mode)
-        counts = keops_radius_count(points, points, search_radius)
+        counts = tc_radius_count(points, points, search_radius)
         counts_list.append(counts)
         if sub_size > 0:
             sub_size *= radius_scaling

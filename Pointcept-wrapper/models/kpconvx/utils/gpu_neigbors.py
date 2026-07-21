@@ -1,7 +1,10 @@
 #
 # For licensing see accompanying LICENSE file.
 # Copyright (C) 2024 Apple Inc. All Rights Reserved.
-# 
+#
+# Modifications Copyright (C) 2026 Orion Hoch: PyKeOps replaced by torch-cluster
+# (Windows support, no runtime CUDA JIT). Same contract as the keops version.
+#
 # ----------------------------------------------------------------------------------------------------------------------
 #
 #   Hugues THOMAS - 06/10/2023
@@ -10,66 +13,137 @@
 #       > Neighbors search functions on gpu
 #
 
-
 from typing import Tuple
 
 import torch
 from torch import Tensor
+
+try:
+    import torch_cluster
+except ImportError as e:
+    raise ImportError(
+        "KPConvX (keops-free fork) requires torch-cluster. Install the wheel "
+        "matching your torch/CUDA build, e.g.:\n"
+        "  pip install torch-cluster -f https://data.pyg.org/whl/torch-2.3.0+cu121.html"
+    ) from e
 
 from pointcept.models.kpconvx.utils.batch_conversion import batch_to_pack, pack_to_batch, pack_to_list, list_to_pack
 
 
 # ----------------------------------------------------------------------------------------------------------------------
 #
-#           Implementation of k-nn search in Keops
-#       \********************************************/
+#           Implementation of k-nn search with torch-cluster
+#       \****************************************************/
 #
 
+
+def _flatten_batched(points: Tensor) -> Tuple[Tensor, Tensor, int]:
+    """(B, N, C) -> packed (B*N, C) + batch vector."""
+    B, N, _ = points.shape
+    batch = torch.arange(B, device=points.device).repeat_interleave(N)
+    return points.reshape(B * N, points.shape[-1]), batch, N
+
+
+def _pairs_to_table(q_idx: Tensor, s_idx: Tensor, d2: Tensor, num_queries: int, k: int,
+                    fill_index: int) -> Tuple[Tensor, Tensor]:
+    """Pairs -> dense row-sorted (Q, k) tables; ties break by support index;
+    empty slots get dist=inf / index=fill_index. Sort order is enforced here,
+    never assumed from torch-cluster."""
+    device = d2.device
+
+    if s_idx.numel():
+        perm = torch.argsort(q_idx * (int(s_idx.max()) + 2) + s_idx)
+        q_idx, s_idx, d2 = q_idx[perm], s_idx[perm], d2[perm]
+
+    counts = torch.bincount(q_idx, minlength=num_queries)
+    starts = torch.cumsum(counts, 0) - counts
+    slot = torch.arange(q_idx.shape[0], device=device) - starts[q_idx]
+
+    table_d2 = torch.full((num_queries, k), float('inf'), dtype=d2.dtype, device=device)
+    table_idx = torch.full((num_queries, k), fill_index, dtype=torch.long, device=device)
+    table_d2[q_idx, slot] = d2
+    table_idx[q_idx, slot] = s_idx
+
+    table_d2, order = torch.sort(table_d2, dim=-1, stable=True)
+    table_idx = torch.gather(table_idx, -1, order)
+    return table_d2, table_idx
+
+
 @torch.no_grad()
-def keops_radius_count(q_points: Tensor, s_points: Tensor, radius: float) -> Tensor:
+def tc_radius_count(q_points: Tensor, s_points: Tensor, radius: float) -> Tensor:
     """
-    Count neigbors inside radius with PyKeOps.
+    Count neighbors strictly inside radius (d < radius, like keops did).
     Args:
-        q_points (Tensor): (*, N, C)
-        s_points (Tensor): (*, M, C)
+        q_points (Tensor): (N, C) or (B, N, C)
+        s_points (Tensor): (M, C) or (B, M, C)
         radius (float)
     Returns:
-        radius_counts (Tensor): (*, N)
+        radius_counts (Tensor): (N,) or (B, N)
     """
-        
-    import pykeops
-    pykeops.set_verbose(False)
+    batched = q_points.dim() == 3
+    if batched:
+        B = q_points.shape[0]
+        q_flat, q_batch, Nq = _flatten_batched(q_points)
+        s_flat, s_batch, _ = _flatten_batched(s_points)
+    else:
+        q_flat, s_flat, q_batch, s_batch = q_points, s_points, None, None
 
-    num_batch_dims = q_points.dim() - 2
-    xi = pykeops.torch.LazyTensor(q_points.unsqueeze(-2))  # (*, N, 1, C)
-    xj = pykeops.torch.LazyTensor(s_points.unsqueeze(-3))  # (*, 1, M, C)
-    dij = (xi - xj).norm2()  # (*, N, M)
-    vij = (radius - dij).relu().sign()  # (*, N, M)
-    radius_counts = vij.sum(dim=num_batch_dims + 1)  # (*, N)
-    return radius_counts
+    # a saturated max_num_neighbors cap would silently truncate calibration counts
+    cap = 64
+    while True:
+        edge = torch_cluster.radius(x=s_flat, y=q_flat, r=radius,
+                                    batch_x=s_batch, batch_y=q_batch,
+                                    max_num_neighbors=cap)
+        raw = torch.bincount(edge[0], minlength=q_flat.shape[0])
+        if raw.numel() == 0 or raw.max().item() < cap:
+            break
+        cap *= 2
+
+    # torch-cluster includes d == radius; keops counted strictly
+    d2 = ((q_flat[edge[0]] - s_flat[edge[1]]) ** 2).sum(-1)
+    strict = edge[0][d2 < radius * radius]
+    counts = torch.bincount(strict, minlength=q_flat.shape[0])
+    if batched:
+        counts = counts.reshape(B, Nq)
+    return counts
+
 
 @torch.no_grad()
-def keops_knn(q_points: Tensor, s_points: Tensor, k: int) -> Tuple[Tensor, Tensor]:
+def tc_knn(q_points: Tensor, s_points: Tensor, k: int) -> Tuple[Tensor, Tensor]:
     """
-    kNN with PyKeOps.
+    kNN: SQUARED distances, rows sorted ascending, indices local per batch element.
     Args:
-        q_points (Tensor): (*, N, C)
-        s_points (Tensor): (*, M, C)
+        q_points (Tensor): (N, C) or (B, N, C)
+        s_points (Tensor): (M, C) or (B, M, C)
         k (int)
     Returns:
-        knn_distance (Tensor): (*, N, k)
+        knn_d2 (Tensor): (*, N, k)
         knn_indices (LongTensor): (*, N, k)
     """
+    batched = q_points.dim() == 3
+    if batched:
+        B = q_points.shape[0]
+        q_flat, q_batch, Nq = _flatten_batched(q_points)
+        s_flat, s_batch, Ms = _flatten_batched(s_points)
+    else:
+        q_flat, s_flat, q_batch, s_batch = q_points, s_points, None, None
 
-    import pykeops
-    pykeops.set_verbose(False)
-    
-    xi = pykeops.torch.LazyTensor(q_points.unsqueeze(-2))  # (*, N, 1, C)
-    xj = pykeops.torch.LazyTensor(s_points.unsqueeze(-3))  # (*, 1, M, C)
-    dij = (xi - xj).sqnorm2()  # (*, N, M)
-    knn_d2, knn_indices = dij.Kmin_argKmin(k, dim=q_points.dim() - 1)  # (*, N, K)
-    return knn_d2, knn_indices
-    
+    edge = torch_cluster.knn(x=s_flat, y=q_flat, k=k, batch_x=s_batch, batch_y=q_batch)
+    q_idx, s_idx = edge[0], edge[1]
+    d2 = ((q_flat[q_idx] - s_flat[s_idx]) ** 2).sum(-1)
+
+    table_d2, table_idx = _pairs_to_table(q_idx, s_idx, d2, q_flat.shape[0], k,
+                                          fill_index=0)
+
+    if batched:
+        # global -> per-element indices; inf (empty) slots must not go negative
+        offsets = (torch.arange(B, device=table_idx.device) * Ms).repeat_interleave(Nq)
+        table_idx = torch.where(torch.isinf(table_d2), table_idx,
+                                table_idx - offsets.view(-1, 1))
+        table_d2 = table_d2.reshape(B, Nq, k)
+        table_idx = table_idx.reshape(B, Nq, k)
+    return table_d2, table_idx
+
 
 @torch.no_grad()
 def knn(q_points: Tensor,
@@ -84,7 +158,6 @@ def knn(q_points: Tensor,
         inf: float = 1e10):
     """
     Compute the kNNs of the points in `q_points` from the points in `s_points`.
-    Use KeOps to accelerate computation.
     Args:
         s_points (Tensor): coordinates of the support points, (*, C, N) or (*, N, C).
         q_points (Tensor): coordinates of the query points, (*, C, M) or (*, M, C).
@@ -111,7 +184,7 @@ def knn(q_points: Tensor,
         dilated_k += 1
     final_k = min(dilated_k, num_s_points)
 
-    knn_distances, knn_indices = keops_knn(q_points, s_points, final_k)  # (*, N, k)
+    knn_distances, knn_indices = tc_knn(q_points, s_points, final_k)  # (*, N, k)
 
     if remove_nearest:
         knn_distances = knn_distances[..., 1:]
@@ -153,17 +226,21 @@ def radius_search_pack_mode(q_points, s_points, q_lengths, s_lengths, radius, ne
     Returns:
         neighbor_indices (LongTensor): the indices of the neighbors. Equal to N if not exist.
     """
+    device = q_points.device
+    # lengths may arrive as lists or off-device; repeat_interleave is strict
+    q_lengths = torch.as_tensor(q_lengths, device=device).long()
+    s_lengths = torch.as_tensor(s_lengths, device=device).long()
+    q_batch = torch.arange(q_lengths.shape[0], device=device).repeat_interleave(q_lengths)
+    s_batch = torch.arange(s_lengths.shape[0], device=device).repeat_interleave(s_lengths)
 
-    # pack to batch
-    batch_q_points, batch_q_masks = pack_to_batch(q_points, q_lengths, fill_value=inf)  # (B, M', 3)
-    batch_s_points, batch_s_masks = pack_to_batch(s_points, s_lengths, fill_value=inf)  # (B, N', 3)
+    edge = torch_cluster.knn(x=s_points, y=q_points, k=neighbor_limit,
+                             batch_x=s_batch, batch_y=q_batch)
+    q_idx, s_idx = edge[0], edge[1]
+    d2 = ((q_points[q_idx] - s_points[s_idx]) ** 2).sum(-1)
 
-    # knn  (B, M', K)
-    batch_knn_distances, batch_knn_indices = keops_knn(batch_q_points, batch_s_points, neighbor_limit)
-
-    # accumulate index
-    batch_start_index = torch.cumsum(s_lengths, dim=0) - s_lengths
-    batch_knn_indices += batch_start_index.view(-1, 1, 1)
+    knn_distances, knn_indices = _pairs_to_table(q_idx, s_idx, d2, q_points.shape[0],
+                                                 neighbor_limit,
+                                                 fill_index=s_points.shape[0])
 
     # Limit for shadow neighbors
     if shadow:
@@ -174,21 +251,18 @@ def radius_search_pack_mode(q_points, s_points, q_lengths, s_lengths, radius, ne
         shadow_limit = inf / 10
 
     # Fill shadow neighbors values
-    batch_knn_masks = torch.gt(batch_knn_distances, shadow_limit)
-    batch_knn_indices.masked_fill_(batch_knn_masks, s_points.shape[0])  # (B, M', K)
+    knn_masks = torch.gt(knn_distances, shadow_limit)
+    knn_indices = knn_indices.masked_fill(knn_masks, s_points.shape[0])  # (M, K)
 
-    # batch to pack
-    knn_indices, _ = batch_to_pack(batch_knn_indices, batch_q_masks)  # (M, K)
     if return_dist:
-        knn_distances, _ = batch_to_pack(batch_knn_distances, batch_q_masks)  # (M, K)
         return knn_indices, torch.sqrt(knn_distances)
-    
+
     return knn_indices
 
 @torch.no_grad()
 def radius_search_list_mode(q_points, s_points, q_lengths, s_lengths, radius, neighbor_limit, shadow=False):
     """
-    Radius search in pack mode (fast version). This function is actually a knn search 
+    Radius search in pack mode (fast version). This function is actually a knn search
     but with option to shadow furthest neighbors (d > radius).
     Args:
         q_points (Tensor): query points (M, 3).
@@ -207,7 +281,7 @@ def radius_search_list_mode(q_points, s_points, q_lengths, s_lengths, radius, ne
     batch_s_list = pack_to_list(s_points, s_lengths)  # (B)(?, 3)
 
     # knn on each element of the list (B)[(?, K), (?, K)]
-    knn_dists_inds = [keops_knn(b_q_pts, b_s_pts, neighbor_limit)
+    knn_dists_inds = [tc_knn(b_q_pts, b_s_pts, neighbor_limit)
                           for b_q_pts, b_s_pts in zip(batch_q_list, batch_s_list)]
 
     # Accumualte indices
@@ -266,12 +340,12 @@ def tiled_knn(q_points: Tensor, s_points: Tensor, k: int, tile_size: float, marg
                 tile_min = min_p + tile_size * torch.tensor([xi, yi, zi],
                                                             dtype=q_points.dtype,
                                                             device=q_points.device)
-                tile_max = tile_min + tile_size + 0.1* margin 
+                tile_max = tile_min + tile_size + 0.1* margin
                 q_mask = torch.logical_and(torch.all(q_points > tile_min, dim=-1),
                                            torch.all(q_points <= tile_max, dim=-1))
                 s_mask = torch.logical_and(torch.all(s_points > tile_min - margin, dim=-1),
                                            torch.all(s_points <= tile_max + margin, dim=-1))
-                                           
+
                 # Get points in the tile
                 q_pts = q_points[q_mask]
                 s_pts = s_points[s_mask]
@@ -281,7 +355,7 @@ def tiled_knn(q_points: Tensor, s_points: Tensor, k: int, tile_size: float, marg
                     raise ValueError('got queries but no support points')
 
                 # Get knn
-                knn_d, knn_i = keops_knn(q_pts, s_pts, k)
+                knn_d, knn_i = tc_knn(q_pts, s_pts, k)
 
                 # (*, N_i),  (*, N_i) values in M_i
                 knn_distances[q_mask] = knn_d.view((-1))

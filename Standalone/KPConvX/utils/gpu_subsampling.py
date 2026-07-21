@@ -19,7 +19,7 @@ from utils.gpu_init import init_gpu, tensor_MB
 
 from utils.cuda_funcs import furthest_point_sample
 from utils.cpp_funcs import furthest_point_sample_cpp
-from utils.gpu_neigbors import keops_knn
+from utils.gpu_neigbors import tc_knn
 
 
 # ----------------------------------------------------------------------------------------------------------------------
@@ -571,14 +571,15 @@ def fp_subsample(points, sub_size,
 def pools_from_invs(inv_inds, counts):
 
     M = counts.shape[0]
-    k = torch.max(counts)
-    queries = torch.arange(M, dtype=inv_inds.dtype)
+    k = int(torch.max(counts))   # torch-cluster needs a python int
+    queries = torch.arange(M, dtype=inv_inds.dtype, device=inv_inds.device)
 
     # Choose which function we use
     if 'cuda' in inv_inds.device.type:
-        queries = queries.unsqueeze(-1)
-        supports = inv_inds.unsqueeze(-1)
-        knn_distances, knn_indices = keops_knn(queries, supports, k) 
+        # float coords for torch-cluster; ints < 2^24 stay exact
+        queries = queries.unsqueeze(-1).float()
+        supports = inv_inds.unsqueeze(-1).float()
+        knn_distances, knn_indices = tc_knn(queries, supports, k)
 
     else:
         xi = queries.unsqueeze(-1)  # (M, 1)
